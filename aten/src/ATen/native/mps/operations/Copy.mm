@@ -188,7 +188,6 @@ static at::Tensor& copy_from_mps_(at::Tensor& dst_, const at::Tensor& src_, bool
 
 // Copies tensor from cpu to mps backed by identical strided-contiguous data
 static void copy_to_mps_stride_contig(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
-  MPSStream* stream = getCurrentMPSStream();
   id<MTLDevice> device = MPSDevice::getInstance()->device();
   auto dst_byte_offset = dst.storage_offset() * dst.itemsize();
   auto src_byte_offset = src.storage_offset() * src.itemsize();
@@ -258,9 +257,6 @@ static void copy_to_mps_stride_contig(at::Tensor& dst, const at::Tensor& src, bo
       }
     }
 
-    // Ensure the device sees the updated shared memory before any GPU work
-    stream->synchronize(SyncType::COMMIT_AND_WAIT);
-
     [sourceBuffer release];
   }
 }
@@ -281,17 +277,29 @@ static at::Tensor& copy_to_mps_(at::Tensor& dst_, const at::Tensor& src_, bool n
     TORCH_INTERNAL_ASSERT(is_dense_in_storage(src));
   }
   Tensor dst = dst_;
-  bool needs_copy = false;
+  bool needs_scatter = false;
+  auto sameMemFormat =
+      src.is_contiguous(dst_.suggest_memory_format()) && dst_.is_contiguous(dst_.suggest_memory_format());
+  
   // If src and dst_ strides do not match, it means that
   // either dst_ is not representable as 1d view or its stride order is different
-  // in that case create an empty storage like src, copy it to device and then do
-  // reshaping on the device
-  if (src.strides() != dst_.strides()) {
-    needs_copy = true;
+  // in that case copy contiguous src to device and then use scatter to place it into dst_ layout
+  if ((src.strides() != dst_.strides()) || (!src.is_contiguous(MemoryFormat::Contiguous) && !sameMemFormat)) {
+    needs_scatter = true;
     dst = at::empty_like(src, at::device(at::kMPS));
   }
-  copy_to_mps_stride_contig(dst, src, non_blocking && !needs_copy);
-  return needs_copy ? dst_.copy_(dst) : dst_;
+  copy_to_mps_stride_contig(dst, src, non_blocking && !needs_scatter);
+  
+  // If strides don't match, scatter the contiguous GPU tensor into the strided destination
+  if (needs_scatter) {
+    scatterViewTensor(dst, dst_);
+  }
+
+  // Ensure scatter happens before any future GPU read
+  MPSStream* stream = getCurrentMPSStream();
+  stream->synchronize(SyncType::COMMIT_AND_WAIT);
+
+  return dst_;
 }
 
 void copy_blit_mps(void* dst, const void* src, size_t size) {
