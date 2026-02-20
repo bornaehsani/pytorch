@@ -90,12 +90,11 @@ static at::Tensor& copy_from_mps_(at::Tensor& dst_, const at::Tensor& src_, bool
       src_.is_contiguous(dst_.suggest_memory_format()) && dst_.is_contiguous(dst_.suggest_memory_format());
 
   id<MTLDevice> device = MPSDevice::getInstance()->device();
-  MPSStream* stream = getCurrentMPSStream();
   Tensor dst = dst_;
   Tensor src = src_;
 
   if (dst_.strides() != src_.strides()) {
-    dst = at::empty_like(dst_, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
+    dst = at::empty_like(dst_, at::device(at::kCPU));
   }
 
   auto storage_byte_offset = src_.storage_offset() * src_.itemsize();
@@ -123,6 +122,11 @@ static at::Tensor& copy_from_mps_(at::Tensor& dst_, const at::Tensor& src_, bool
     // 4 bytes alignment required on macos for blits.
     TORCH_INTERNAL_ASSERT(destOffset % 4 == 0, "Unaligned copy request");
 
+    // Ensure any GPU work that produced `sourceBuffer` is finished and
+    // the contents are visible to the CPU before we memcpy.
+    MPSStream* stream = getCurrentMPSStream();
+    stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    
     // Both src and dst tensors have MTLBuffer backing in shared storage
     // we can memcpy directly between their contents pointers and avoid encoding
     // a Metal blit.
@@ -133,31 +137,27 @@ static at::Tensor& copy_from_mps_(at::Tensor& dst_, const at::Tensor& src_, bool
     TORCH_INTERNAL_ASSERT(sourceBuffer.storageMode == MTLStorageModeShared);
     TORCH_INTERNAL_ASSERT(destBuffer.storageMode == MTLStorageModeShared);
 
-    // Ensure any GPU work that produced `sourceBuffer` is finished and
-    // the contents are visible to the CPU.
-    stream->synchronize(SyncType::COMMIT_AND_WAIT);
-
     const void* src_ptr = static_cast<const char*>((void*)[sourceBuffer contents]) + storage_byte_offset;
     void* dst_ptr = static_cast<char*>((void*)[destBuffer contents]) + destOffset;
 
-    // Handle logical metadata differences negation/conjugation
-    // if these differ we must manually apply the transform before copying.
+    // Handle logical metadata and property differences
     const bool needs_conj = src_.is_conj() != dst.is_conj();
     const bool needs_neg = src_.is_neg() != dst.is_neg();
     const bool needs_type_conv = src_.dtype() != dst.dtype();
+    const bool needs_memory_format = src_.suggest_memory_format() != at::MemoryFormat::Contiguous;
+    const bool needs_quant = src_.is_quantized();
+    const bool needs_requires_grad = src_.requires_grad();
+    const bool needs_layout = src_.layout() != c10::kStrided;
+    const bool needs_property_conversion = needs_conj || needs_neg || needs_type_conv || needs_memory_format || needs_quant || needs_requires_grad || needs_layout;
 
-    if (!needs_type_conv && !needs_conj && !needs_neg) {
-      // Same element type and no conjugation/negation metadata differences
+    if (!needs_property_conversion) {
+      // No property differences, plain memcpy is sufficient
       if (dst_ptr != src_ptr) {
-        // a plain memcpy is sufficient
         memcpy(dst_ptr, src_ptr, dst_tensor_nbytes);
-      } else {
-        // pointers are identical, nothing to do
       }
     } else {
       // Create a CPU tensor view over the shared buffer and perform any
-      // required conjugation/negation and dtype conversion on the CPU,
-      // then copy into the destination.
+      // required property conversions on the CPU, then copy into the destination.
       Tensor src_cpu_view = at::from_blob(const_cast<void*>(src_ptr),
                                           src.sizes(),
                                           src.strides(),
@@ -172,7 +172,27 @@ static at::Tensor& copy_from_mps_(at::Tensor& dst_, const at::Tensor& src_, bool
       if (needs_type_conv) {
         tmp = tmp.to(dst.dtype());
       }
-      dst.copy_(tmp, non_blocking);
+      if (needs_memory_format) {
+        tmp = tmp.contiguous(src_.suggest_memory_format());
+      } else {
+        tmp = tmp.contiguous();
+      }
+      // if (needs_quant) {
+      //   tmp.set_quantizer_(src_.quantizer());
+      // }
+      // if (needs_requires_grad) {
+      //   tmp.set_requires_grad_(src_.requires_grad());
+      // }
+      if (needs_layout) {
+        tmp = tmp.to_sparse(src_.layout());
+      }
+      // dst.copy_(tmp, non_blocking);
+
+      const void* tmp_ptr = static_cast<const char*>(tmp.storage().data()) + tmp.storage_offset() * tmp.itemsize();
+      if (dst_ptr != tmp_ptr) {
+        memcpy(dst_ptr, tmp_ptr, dst_tensor_nbytes);
+      }
+
     }
     
     [destBuffer release];
@@ -180,6 +200,7 @@ static at::Tensor& copy_from_mps_(at::Tensor& dst_, const at::Tensor& src_, bool
 
   if (!dst.is_same(dst_)) {
     dst_.copy_(dst, non_blocking);
+    dst_.set_requires_grad(src_.requires_grad());
   }
 
   return dst_;
@@ -226,19 +247,21 @@ static void copy_to_mps_stride_contig(at::Tensor& dst, const at::Tensor& src, bo
     const bool needs_conj = src.is_conj() != dst.is_conj();
     const bool needs_neg = src.is_neg() != dst.is_neg();
     const bool needs_type_conv = src.dtype() != dst.dtype();
+    const bool needs_memory_format = src.suggest_memory_format() != at::MemoryFormat::Contiguous;
+    const bool needs_quant = src.is_quantized();
+    const bool needs_requires_grad = src.requires_grad();
+    const bool needs_layout = src.layout() != c10::kStrided;
+    const bool needs_property_conversion = needs_conj || needs_neg || needs_type_conv || needs_memory_format || needs_quant ||
+        needs_requires_grad || needs_layout;
 
-    if (!needs_type_conv && !needs_conj && !needs_neg) {
-      // Same element type and no conjugation/negation metadata differences
+    if (!needs_property_conversion) {
+      // No property differences, plain memcpy is sufficient
       if (dst_ptr != src_ptr) {
-        // a plain memcpy is sufficient
         memcpy(dst_ptr, src_ptr, size_to_copy);
-      } else {
-        // pointers are identical, nothing to do
       }
     } else {
       // Create a CPU tensor view over the shared buffer and perform any
-      // required conjugation/negation and dtype conversion on the CPU,
-      // then make it contiguous and memcopy into the destination.
+      // required property conversions on the CPU, then make it contiguous and memcopy into the destination.
       Tensor tmp = src;
       if (needs_conj) {
         tmp = tmp.conj();
@@ -249,12 +272,26 @@ static void copy_to_mps_stride_contig(at::Tensor& dst, const at::Tensor& src, bo
       if (needs_type_conv) {
         tmp = tmp.to(dst.dtype());
       }
-      tmp = tmp.contiguous();
+      if (needs_memory_format) {
+        tmp = tmp.contiguous(src.suggest_memory_format());
+      } else {
+        tmp = tmp.contiguous();
+      }
+      // if (needs_quant) {
+      //   tmp.set_quantizer_(src.quantizer());
+      // }
+      // if (needs_requires_grad) {
+      //   tmp.set_requires_grad_(src.requires_grad());
+      // }
+      if (needs_layout) {
+        tmp = tmp.to_sparse(src.layout());
+      }
       const void* tmp_ptr = static_cast<const char*>(tmp.storage().data()) + tmp.storage_offset() * tmp.itemsize();
       if (dst_ptr != tmp_ptr) {
         memcpy(dst_ptr, tmp_ptr, size_to_copy);
       }
     }
+    [destBuffer didModifyRange:NSMakeRange(dst_byte_offset, size_to_copy)];
 
     [sourceBuffer release];
   }
@@ -288,6 +325,7 @@ static at::Tensor& copy_to_mps_(at::Tensor& dst_, const at::Tensor& src_, bool n
   copy_to_mps_stride_contig(dst, src, non_blocking && !needs_copy);
   if(needs_copy) {
     dst_ = dst_.copy_(dst);
+    dst_.set_requires_grad(src_.requires_grad());
   }
   
   // Ensure the device sees the updated shared memory before any GPU work
