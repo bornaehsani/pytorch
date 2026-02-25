@@ -250,6 +250,7 @@ static void pool2d_template(const Tensor& input,
     }
 
     runMPSGraph(mpsStream, cachedGraph->graph(), feeds, results);
+    mpsStream->synchronize(SyncType::COMMIT_AND_WAIT);
 
     if (output_memory_format != suggested_memory_format) {
       const_cast<Tensor&>(output) = output.to(suggested_memory_format);
@@ -501,6 +502,7 @@ static void max_pool_with_indices_out_mps_template(const Tensor& output,
           computeEncoder, input, output, return_indices ? std::optional<Tensor>(indices) : std::nullopt, params);
 
       mtl_dispatch1DJob(computeEncoder, maxPoolPSO, numThreads);
+      mpsStream->synchronize(SyncType::COMMIT_AND_WAIT); 
       getMPSProfiler().endProfileKernel(maxPoolPSO);
     }
   });
@@ -550,6 +552,7 @@ static void max_pool_with_indices_backward_out_mps_template(Tensor& grad_input,
       mtl_setArgs(computeEncoder, grad_input, grad_output, indices, params);
 
       mtl_dispatch1DJob(computeEncoder, maxPoolPSO, numThreads);
+      mpsStream->synchronize(SyncType::COMMIT_AND_WAIT); 
       getMPSProfiler().endProfileKernel(maxPoolPSO);
     }
   });
@@ -618,6 +621,7 @@ static void max_unpool_out_mps_template(const Tensor& input,
       mtl_setArgs(computeEncoder, output, input, indices, params, mpsStream->getErrorBuffer());
 
       mtl_dispatch1DJob(computeEncoder, PSO, numThreads);
+      mpsStream->synchronize(SyncType::COMMIT_AND_WAIT);
       getMPSProfiler().endProfileKernel(PSO);
     }
   });
@@ -796,6 +800,7 @@ static void avg_pool_out_mps_template(const Tensor& output,
       mtl_setArgs(computeEncoder, input, output, params);
 
       mtl_dispatch1DJob(computeEncoder, PSO, numThreads);
+      mpsStream->synchronize(SyncType::COMMIT_AND_WAIT);
       getMPSProfiler().endProfileKernel(PSO);
     }
   });
@@ -854,6 +859,7 @@ static void avg_pool_backward_out_mps_template(const Tensor& grad_input,
       mtl_setArgs(computeEncoder, grad_input, grad_output, params);
 
       mtl_dispatch1DJob(computeEncoder, PSO, numThreads);
+      mpsStream->synchronize(SyncType::COMMIT_AND_WAIT); 
       getMPSProfiler().endProfileKernel(PSO);
     }
   });

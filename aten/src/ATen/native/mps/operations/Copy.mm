@@ -77,7 +77,7 @@ static void copy_cast_mps(at::Tensor& dst,
     NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds = @{cachedGraph->inputTensor_ : srcData};
     NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results = @{cachedGraph->outputTensor_ : dstData};
     stream->executeMPSGraph(
-        cachedGraph->graph(), feeds, results, !non_blocking ? SyncType::COMMIT_AND_WAIT : SyncType::COMMIT_ADAPTIVE);
+        cachedGraph->graph(), feeds, results, SyncType::COMMIT_AND_WAIT);
   }
 }
 
@@ -353,7 +353,7 @@ static at::Tensor& copy_kernel_mps(at::Tensor& dst_, const at::Tensor& src_, boo
   if (sameDataType) {
     uint64_t profile_id = getMPSProfiler().beginProfileCopy(sourceBuffer, destBuffer, src, dst_, src.nbytes(), true);
     // for GPU to GPU copies we only encode to stream's command buffer (no flushing)
-    stream->copy(sourceBuffer, destBuffer, src.nbytes(), src_byte_offset, dst_byte_offset, profile_id);
+    stream->copy_and_sync(sourceBuffer, destBuffer, src.nbytes(), src_byte_offset, dst_byte_offset, true, profile_id);
   } else {
     if (dst_byte_offset) {
       auto maybeCastedSource =
@@ -363,7 +363,7 @@ static at::Tensor& copy_kernel_mps(at::Tensor& dst_, const at::Tensor& src_, boo
 
       uint64_t profile_id = getMPSProfiler().beginProfileCopy(
           maybeCastedSourceBuffer, destBuffer, maybeCastedSource, dst_, dst_.nbytes(), true);
-      stream->copy(maybeCastedSourceBuffer, destBuffer, dst_.nbytes(), 0, dst_byte_offset, profile_id);
+      stream->copy_and_sync(maybeCastedSourceBuffer, destBuffer, dst_.nbytes(), 0, dst_byte_offset, true, profile_id);
     } else {
       copy_cast_mps(dst_, src, destBuffer, sourceBuffer);
     }
