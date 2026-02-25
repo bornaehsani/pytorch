@@ -145,8 +145,9 @@ static at::Tensor& copy_from_mps_(at::Tensor& dst_, const at::Tensor& src_, bool
     const bool needs_conj = src_.is_conj() != dst.is_conj();
     const bool needs_neg = src_.is_neg() != dst.is_neg();
     const bool needs_type_conv = src_.dtype() != dst.dtype();
+    const bool needs_format_conv = !sameMemFormat;
 
-    if (!needs_type_conv && !needs_conj && !needs_neg) {
+    if (!needs_type_conv && !needs_conj && !needs_neg && !needs_format_conv) {
       // Same element type and no conjugation/negation metadata differences
       if (dst_ptr != src_ptr) {
         // a plain memcpy is sufficient
@@ -172,6 +173,10 @@ static at::Tensor& copy_from_mps_(at::Tensor& dst_, const at::Tensor& src_, bool
       if (needs_type_conv) {
         tmp = tmp.to(dst.dtype());
       }
+      if (needs_format_conv) {
+        tmp = tmp.to(dst.suggest_memory_format());
+      }
+      tmp = tmp.contiguous();
       dst.copy_(tmp, non_blocking);
     }
     
@@ -226,8 +231,10 @@ static void copy_to_mps_stride_contig(at::Tensor& dst, const at::Tensor& src, bo
     const bool needs_conj = src.is_conj() != dst.is_conj();
     const bool needs_neg = src.is_neg() != dst.is_neg();
     const bool needs_type_conv = src.dtype() != dst.dtype();
+    const bool needs_format_conv = 
+        !src.is_contiguous(dst.suggest_memory_format()) || !dst.is_contiguous(dst.suggest_memory_format());
 
-    if (!needs_type_conv && !needs_conj && !needs_neg) {
+    if (!needs_type_conv && !needs_conj && !needs_neg && !needs_format_conv) {
       // Same element type and no conjugation/negation metadata differences
       if (dst_ptr != src_ptr) {
         // a plain memcpy is sufficient
@@ -249,11 +256,11 @@ static void copy_to_mps_stride_contig(at::Tensor& dst, const at::Tensor& src, bo
       if (needs_type_conv) {
         tmp = tmp.to(dst.dtype());
       }
-      tmp = tmp.contiguous();
-      const void* tmp_ptr = static_cast<const char*>(tmp.storage().data()) + tmp.storage_offset() * tmp.itemsize();
-      if (dst_ptr != tmp_ptr) {
-        memcpy(dst_ptr, tmp_ptr, size_to_copy);
+      if(needs_format_conv) {
+        tmp = tmp.to(dst.suggest_memory_format());
       }
+      tmp = tmp.contiguous();
+      dst.copy_(tmp, non_blocking);
     }
 
     [sourceBuffer release];
