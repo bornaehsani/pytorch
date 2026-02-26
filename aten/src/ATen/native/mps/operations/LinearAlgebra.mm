@@ -671,9 +671,13 @@ static Tensor& mm_out_mps_impl(const Tensor& self, const Tensor& other, Tensor& 
 
   TORCH_CHECK(output.is_mps());
 
+  // Edge case behaviors must match _int_mm_out_cpu CPU implementation
   // Transpose inputs if needed
-  if (output.numel() == 0) {
-    return output;
+  // Outer dimension is 0 - [0, a] x [a, 0]
+  // Inner dimension is 0 - [a, 0] x [0, b]
+  if (output.numel() == 0 || self.size(1) == 0) {
+      output.zero_();
+      return output;
   }
 
   // MPS matmul returns silently incorrect results if one of the matrix dimensions is greater than 2**15
@@ -861,9 +865,23 @@ static Tensor& addmm_out_mps_impl(const Tensor& bias,
   if (&output != &self) {
     output.resize_(bias_sizes);
   }
+
+  // Edge case behaviors must match addmm_impl_cpu_ CPU implementation
+  // Outer dimension is 0 - [0, a] x [a, b]
   if (output.numel() == 0) {
     return output;
   }
+  // Inner dimension is 0 - [a, 0] x [0, b]
+  // Early out as some paths in the code below do not handle this case correctly
+  if (self.size(1) == 0) {
+    if (beta.toDouble() == 0.0) {
+        output.zero_();
+    } else {
+        output.copy_(*bias_);
+        output.mul_(beta);
+    }
+    return output;
+}
 
   if (use_metal_mm(self, other, output)) {
     return do_metal_addmm(self, other, output, alpha, beta, *bias_);
