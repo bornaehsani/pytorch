@@ -259,12 +259,12 @@ static Tensor _mps_convolution_impl(const Tensor& input_t,
     });
 
     auto inputPlaceholder = input_suggested_layout == kContiguous
-        ? Placeholder(cachedGraph->inputTensor_, output_c || is3DConv ? input_t.contiguous() : input_t)
+        ? Placeholder(cachedGraph->inputTensor_, input_t)
         : Placeholder(cachedGraph->inputTensor_, getMPSNDArray(input_t, inputShape));
     auto outputPlaceholder = input_suggested_layout == kContiguous
         ? Placeholder(cachedGraph->outputTensor_, output_c ? *output_c : output_t)
         : Placeholder(cachedGraph->outputTensor_, getMPSNDArray(output_t, outputShape));
-    auto weightsPlaceholder = Placeholder(cachedGraph->weightTensor_, output_c ? weight_t.contiguous() : weight_t);
+    auto weightsPlaceholder = Placeholder(cachedGraph->weightTensor_, weight_t);
     auto biasPlaceholder = Placeholder();
     // Reshape the bias to be broadcastable with output of conv2d or conv3d
     if (bias_defined) {
@@ -430,8 +430,8 @@ static Tensor mps_convolution_backward_input(IntArrayRef input_size,
     });
 
     auto gradOutputPlaceholder =
-        Placeholder(cachedGraph->gradOutputTensor_, grad_input_c ? grad_output_t.contiguous() : grad_output_t);
-    auto weightsPlaceholder = Placeholder(cachedGraph->weightTensor_, grad_input_c ? weight_t.contiguous() : weight_t);
+        Placeholder(cachedGraph->gradOutputTensor_, grad_output_t);
+    auto weightsPlaceholder = Placeholder(cachedGraph->weightTensor_, weight_t);
     auto outputPlaceholder = Placeholder(cachedGraph->gradInputTensor_, grad_input_c ? *grad_input_c : grad_input_t);
 
     auto feeds = dictionaryFromPlaceholders(gradOutputPlaceholder, weightsPlaceholder);
@@ -566,8 +566,8 @@ static Tensor mps_convolution_backward_weights(IntArrayRef weight_size,
     });
 
     auto gradOutputPlaceholder =
-        Placeholder(cachedGraph->gradOutputTensor_, grad_weight_c ? grad_output_t.contiguous() : grad_output_t);
-    auto inputPlaceholder = Placeholder(cachedGraph->inputTensor_, grad_weight_c ? input_t.contiguous() : input_t);
+        Placeholder(cachedGraph->gradOutputTensor_, grad_output_t);
+    auto inputPlaceholder = Placeholder(cachedGraph->inputTensor_, input_t);
     auto outputPlaceholder =
         Placeholder(cachedGraph->gradWeightTensor_, grad_weight_c ? *grad_weight_c : grad_weight_t);
 
