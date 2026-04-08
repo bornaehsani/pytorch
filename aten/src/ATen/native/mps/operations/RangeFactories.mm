@@ -199,8 +199,6 @@ Tensor& linspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, 
   } else if (steps == 1) {
     result.fill_(start);
   } else {
-    Tensor r = !mps::needsGather(result) ? result : result.contiguous();
-
     // Do the MPSGraph computation
     MPSGraphCache* cache_ = MPSGraphCache::getInstance();
     MPSStream* stream = getCurrentMPSStream();
@@ -232,7 +230,7 @@ Tensor& linspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, 
 
       NSMutableDictionary* feeds = [[NSMutableDictionary new] autorelease];
       auto multiply = (end.to<double>() - start.to<double>()) / ((double)steps - 1.0f);
-      Placeholder outputPlaceholder = Placeholder(cachedGraph->outputTensor, r);
+      Placeholder outputPlaceholder = Placeholder(cachedGraph->outputTensor, result);
 
       // Create dictionary of inputs and outputs
       MPSScalar startScalar = getMPSScalar(start, ScalarType::Float);
@@ -243,10 +241,6 @@ Tensor& linspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, 
       feeds[cachedGraph->multiplyTensor] = getMPSGraphTensorFromScalar(stream, multiplyScalar);
 
       runMPSGraph(stream, cachedGraph->graph(), feeds, outputPlaceholder);
-    }
-
-    if (!result.is_contiguous()) {
-      result.copy_(r);
     }
   }
   return result;
