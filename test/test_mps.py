@@ -14237,6 +14237,206 @@ class TestMetalLibrary(TestCaseMPS):
         self.assertEqual(x, torch.tensor([1.0, 4.0, 9.0, 16.0], device="mps"))
 
 
+# ------------------------------------------------------------------
+    # Measures latency for representative MPS tensor operations
+    # that call .contiguous() in the process.
+    # Goal of this test is to measure the overhead of the .contiguous() calls.
+    # Each test method reports median latency for one MPS tensor op.
+# ------------------------------------------------------------------
+class TestMPSTensorOpContiguousLatency(TestCase):
+    _device = "mps"
+
+    # Return median latency in microseconds using blocked_autorange for stability.
+    def _measure(self, label: str, stmt: str, globals: dict | None = None) -> float:
+        import torch.utils.benchmark as benchmark
+        import time
+        torch.mps.synchronize()
+        time.sleep(3)  # let GPU frequency recover between measurements
+        timer = benchmark.Timer(
+            stmt=stmt,
+            globals=globals or {},
+            num_threads=1,
+            label="MPS op latency",
+        )
+        m = timer.blocked_autorange(min_run_time=10.0)
+        print(f"\n  [{self.id().split('.')[-1]}][{label}]  mean={m.mean * 1e6:.2f} µs  median={m.median * 1e6:.2f} µs  "
+              f"iqr={m.iqr * 1e6:.2f} µs  ({m.number_per_run} runs/measurement, {len(m.times)} measurements)")
+        return m.median * 1e6
+
+    # ------------------------------------------------------------------
+    # Attention.mm  –  scaled_dot_product_attention
+    # ------------------------------------------------------------------
+    def test_Attention(self):
+        print("Testing Attention.mm...")
+        # The fast SDPA path (_scaled_dot_product_attention_math_mps) calls .contiguous() on q/k/v.
+        # It requires query_seq_len <= 8, head_dim in {64,96,128}. Use S_Q=4, S_KV=1024, D=64.
+        # Transpose (B, S, H, D) -> (B, H, S, D) to produce non-contiguous tensors.
+        B, H, S_Q, S_KV, D = 2, 8, 4, 1024, 64
+        q = torch.randn(B, S_Q, H, D, device=self._device).transpose(1, 2)
+        k = torch.randn(B, S_KV, H, D, device=self._device).transpose(1, 2)
+        v = torch.randn(B, S_KV, H, D, device=self._device).transpose(1, 2)
+        self.assertFalse(q.is_contiguous())
+        self.assertFalse(k.is_contiguous())
+        self.assertFalse(v.is_contiguous())
+        stmt = "F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)"
+        self._measure("non-contiguous", stmt, {"F": F, "q": q, "k": k, "v": v})
+        self._measure("contiguous    ", stmt, {"F": F, "q": q.contiguous(), "k": k.contiguous(), "v": v.contiguous()})
+
+    # ------------------------------------------------------------------
+    # Col2Im.mm  –  torch.nn.functional.fold --> torch.col2im
+    # ------------------------------------------------------------------
+    def test_Col2Im(self):
+        # col2im_out_mps_template() calls input.contiguous().
+        # Shape: (32, 27, 16384) — 32 batches, 3x3 kernel → 27 channels, 128x128 output cols.
+        # Transposing dims 1 and 2 makes it non-contiguous, forcing a real copy.
+        x = torch.randn(32, 16384, 27, device=self._device).transpose(1, 2)
+        self.assertFalse(x.is_contiguous())
+        stmt = "F.fold(x, output_size=(128, 128), kernel_size=3, padding=1, stride=1)"
+        self._measure("non-contiguous", stmt, {"F": F, "x": x})
+        self._measure("contiguous    ", stmt, {"F": F, "x": x.contiguous()})
+
+    # ------------------------------------------------------------------
+    # HistogramKernel.mm  –  torch.histogram (non-contiguous bin_edges)
+    # ------------------------------------------------------------------
+    def test_HistogramKernel(self):
+        # histogramdd_out_mps_template() calls bin_edges[dim].contiguous().
+        # Use torch.histogram with a non-contiguous bins tensor (stride-2 slice) so
+        # bin_edges are passed directly through to that call site.
+        bins_buf = torch.linspace(-4.0, 4.0, 514, device=self._device)
+        bins = bins_buf[::2]  # 257 edges → 256 bins, stride=2, non-contiguous
+        self.assertFalse(bins.is_contiguous())
+        x = torch.randn(1_000_000, device=self._device)
+        stmt = "torch.histogram(x, bins=bins)"
+        self._measure("non-contiguous", stmt, {"torch": torch, "x": x, "bins": bins})
+        self._measure("contiguous    ", stmt, {"torch": torch, "x": x, "bins": bins.contiguous()})
+
+    # ------------------------------------------------------------------
+    # Im2Col.mm  –  torch.nn.functional.unfold --> torch.im2col
+    # ------------------------------------------------------------------
+    def test_Im2Col(self):
+        # im2col_out_mps_template() calls input_.contiguous() unconditionally.
+        # Use kernel_size=(1,1) so the output is the same size as the input —
+        # the kernel does minimal work per element, making the ~80MB input copy
+        # the dominant cost. A large (4, 64, 512, 512) tensor sliced at stride=2
+        # in H gives a non-contiguous ~64MB input.
+        x = torch.randn(4, 64, 1024, 512, device=self._device)[:, :, ::2, :]
+        self.assertFalse(x.is_contiguous())
+        stmt = "F.unfold(x, kernel_size=(1, 1))"
+        self._measure("non-contiguous", stmt, {"F": F, "x": x})
+        self._measure("contiguous    ", stmt, {"F": F, "x": x.contiguous()})
+
+    # ------------------------------------------------------------------
+    # Indexing.mm  –  torch.nonzero
+    # ------------------------------------------------------------------
+    def test_Indexing(self):
+        # nonzero_impl_mps() calls self.contiguous() on input tensor.
+        # ~1% True keeps output small so timing reflects input copy cost, not output scatter.
+        x = (torch.randn(4000, 2000, device=self._device) > 2.3).transpose(0, 1)  # (2000, 4000), non-contiguous
+        self.assertFalse(x.is_contiguous())
+        stmt = "torch.nonzero(x)"
+        self._measure("non-contiguous", stmt, {"torch": torch, "x": x})
+        self._measure("contiguous    ", stmt, {"torch": torch, "x": x.contiguous()})
+
+    # ------------------------------------------------------------------
+    # Linear.mm  –  F.linear backward (grad input)
+    # ------------------------------------------------------------------
+    def test_LinearOps(self):
+        # _mps_linear_backward_input() calls weight.contiguous().
+        # Trigger it by running the backward pass with a non-contiguous weight.
+        # Shape: input (512, 2048), weight (4096, 2048). Make weight non-contiguous
+        # by creating it as (2048, 4096) and transposing → (4096, 2048) strides (1, 2048).
+        x = torch.randn(512, 2048, device=self._device, requires_grad=True)
+        w = torch.randn(2048, 4096, device=self._device)
+        w_nc = w.t()  # (4096, 2048), strides (1, 2048), non-contiguous
+        self.assertFalse(w_nc.is_contiguous())
+        # Pre-compute forward outputs and grad to isolate backward cost
+        out_nc = F.linear(x, w_nc)
+        grad = torch.ones_like(out_nc)
+        stmt = "out.backward(grad, retain_graph=True)"
+        self._measure("non-contiguous", stmt, {"out": out_nc, "grad": grad})
+        out_c = F.linear(x, w_nc.contiguous())
+        self._measure("contiguous    ", stmt, {"out": out_c, "grad": grad})
+
+    # ------------------------------------------------------------------
+    # LossOps.mm  –  huber_loss backward
+    # ------------------------------------------------------------------
+    def test_LossOps(self):
+        # huber_loss_backward_out_mps() calls grad_output.contiguous().
+        # Trigger it by running backward with a non-contiguous grad.
+        # Use large tensors (~8MB each) so the copy cost is measurable.
+        input = torch.randn(2000, 2000, device=self._device, requires_grad=True)
+        target = torch.randn(2000, 2000, device=self._device)
+        loss = F.huber_loss(input, target, reduction="none")  # shape (2000, 2000)
+        # Transpose grad so it is non-contiguous when passed to backward
+        grad = loss.detach().transpose(0, 1).contiguous().transpose(0, 1)
+        self.assertFalse(grad.is_contiguous())
+        stmt = "loss.backward(grad, retain_graph=True)"
+        self._measure("non-contiguous", stmt, {"loss": loss, "grad": grad})
+        self._measure("contiguous    ", stmt, {"loss": loss, "grad": grad.contiguous()})
+
+    # ------------------------------------------------------------------
+    # Pooling.mm  –  max_pool2d backward
+    # ------------------------------------------------------------------
+    def test_Pooling(self):
+        # mps_max_pool2d_backward() calls grad_output.contiguous().
+        # Call the aten op directly to avoid autograd overhead.
+        # grad is made non-contiguous via NHWC permute so the copy always runs.
+        x = torch.randn(16, 128, 112, 112, device=self._device)
+        out = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)  # (16,128,56,56)
+        grad = torch.ones_like(out).permute(0, 2, 3, 1).contiguous().permute(0, 3, 1, 2)
+        self.assertFalse(grad.is_contiguous())
+        stmt = "torch.ops.aten.max_pool2d_backward(grad, x, [3], [2], [1], [1], False)"
+        self._measure("non-contiguous", stmt, {"torch": torch, "grad": grad, "x": x})
+        self._measure("contiguous    ", stmt, {"torch": torch, "grad": grad.contiguous(), "x": x})
+
+    # ------------------------------------------------------------------
+    # RangeFactories.mm  –  torch.linspace (out= variant)
+    # ------------------------------------------------------------------
+    def test_RangeFactories(self):
+        # linspace_out_mps() calls result.contiguous() and runs the kernel
+        # into the contiguous copy, then copies back via result.copy_(r).
+        buf = torch.empty(4_000_000, dtype=torch.float32, device=self._device)
+        out = buf[::2]  # 2M elements, stride=2, non-contiguous
+        self.assertFalse(out.is_contiguous())
+        stmt = "torch.linspace(0, 1, 2_000_000, dtype=torch.float32, device=device, out=out)"
+        self._measure("non-contiguous", stmt, {"torch": torch, "device": self._device, "out": out})
+        self._measure("contiguous    ", stmt, {"torch": torch, "device": self._device, "out": out.contiguous()})
+
+    # ------------------------------------------------------------------
+    # Repeat.mm  –  torch.repeat_interleave
+    # ------------------------------------------------------------------
+    def test_RepeatOps(self):
+        # repeat_interleave_mps() calls repeat.contiguous().
+        # Pass a non-contiguous 1D repeats tensor (stride-2 slice) so the copy runs.
+        repeats_buf = torch.ones(1_000_000, dtype=torch.long, device=self._device).mul_(2)
+        repeats = repeats_buf[::2]  # 500_000 elements, stride=2, non-contiguous
+        self.assertFalse(repeats.is_contiguous())
+        stmt = "torch.repeat_interleave(repeats)"
+        self._measure("non-contiguous", stmt, {"torch": torch, "repeats": repeats})
+        self._measure("contiguous    ", stmt, {"torch": torch, "repeats": repeats.contiguous()})
+
+    # ------------------------------------------------------------------
+    # RMSNorm.mm  –  _fused_rms_norm_mps
+    # ------------------------------------------------------------------
+    def test_RMSNorm(self):
+        # _fused_rms_norm_mps() calls weight_opt.value().contiguous().
+        # The kernel TORCH_CHECK requires input to be contiguous, so only weight
+        # is made non-contiguous (stride-2 slice of a 2x-wide buffer → 4MB copy).
+        normalized_shape = (1024, 1024)
+        weight_buf = torch.ones(1024, 2048, device=self._device)
+        weight_nc = weight_buf[:, ::2]   # (1024, 1024), stride-2 on last dim — non-contiguous
+        self.assertFalse(weight_nc.is_contiguous())
+        rms_norm = torch.nn.RMSNorm(normalized_shape, device=self._device)
+        rms_norm.weight = torch.nn.Parameter(weight_nc)
+        x = torch.randn(64, 1024, 1024, device=self._device)  # contiguous, as required
+        self.assertTrue(x.is_contiguous())
+        stmt = "rms_norm(x)"
+        self._measure("non-contiguous", stmt, {"rms_norm": rms_norm, "x": x})
+        rms_norm_c = torch.nn.RMSNorm(normalized_shape, device=self._device)
+        rms_norm_c.weight = torch.nn.Parameter(weight_nc.contiguous())
+        self._measure("contiguous    ", stmt, {"rms_norm": rms_norm_c, "x": x})
+
+
 # TODO: Actually instantiate that test for the "mps" device to better reflect what it is doing.
 # This requires mps to be properly registered in the device generic test framework which is not the
 # case right now. We can probably use `allow_mps` introduced in https://github.com/pytorch/pytorch/pull/87342
