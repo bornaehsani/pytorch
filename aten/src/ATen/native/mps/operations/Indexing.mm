@@ -308,7 +308,7 @@ static void nonzero_impl_mps(const Tensor& self, Tensor& out_, std::optional<int
               self.device());
   TORCH_CHECK(out_.is_mps());
 
-  Tensor input = self.contiguous();
+  Tensor input = self;
   const int64_t nDim = self.dim();
   const auto numel = static_cast<uint32_t>(input.numel());
   const auto type_str = scalarToMetalTypeString(input);
@@ -335,7 +335,7 @@ static void nonzero_impl_mps(const Tensor& self, Tensor& out_, std::optional<int
       auto computeEncoder = stream->commandEncoder();
 
       [computeEncoder setComputePipelineState:pso_step1];
-      mtl_setArgs(computeEncoder, input, prefix_buf, block_sums_buf);
+      mtl_setArgs(computeEncoder, input, prefix_buf, block_sums_buf, input.strides(), input.sizes(), (int)nDim);
       mtl_dispatch1DJob(computeEncoder, pso_step1, numel);
 
       [computeEncoder setComputePipelineState:pso_step2];
@@ -368,7 +368,7 @@ static void nonzero_impl_mps(const Tensor& self, Tensor& out_, std::optional<int
     @autoreleasepool {
       auto computeEncoder = stream->commandEncoder();
       [computeEncoder setComputePipelineState:pso_step3];
-      mtl_setArgs(computeEncoder, input, prefix_buf, out, ndim_int, input.sizes(), block_offsets_buf, max_entries);
+      mtl_setArgs(computeEncoder, input, prefix_buf, out, ndim_int, input.sizes(), block_offsets_buf, max_entries, input.strides());
       mtl_dispatch1DJob(computeEncoder, pso_step3, numel);
     }
   });

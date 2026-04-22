@@ -817,12 +817,31 @@ inline bool is_nonzero(T val) {
   return val.x != 0 || val.y != 0;
 }
 
+// Compute the physical byte offset for logical flat index `tid` given
+// per-dimension sizes and strides (both in elements, not bytes).
+inline uint strided_offset(uint tid,
+                           constant int64_t* sizes,
+                           constant int64_t* strides,
+                           int ndim) {
+  uint offset = 0;
+  uint flat = tid;
+  for (int d = ndim - 1; d >= 0; d--) {
+    uint dim_size = static_cast<uint>(sizes[d]);
+    offset += (flat % dim_size) * static_cast<uint>(strides[d]);
+    flat /= dim_size;
+  }
+  return offset;
+}
+
 template <typename T>
 [[max_total_threads_per_threadgroup(1024)]]
 kernel void count_nonzero_prefix_sum(
     const device T* input [[buffer(0)]],
     device int* prefix [[buffer(1)]],
     device int* block_sums [[buffer(2)]],
+    constant int64_t* strides [[buffer(3)]],
+    constant int64_t* sizes [[buffer(4)]],
+    constant int& ndim [[buffer(5)]],
     uint tid [[thread_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint tgsize [[threads_per_threadgroup]],
@@ -831,7 +850,7 @@ kernel void count_nonzero_prefix_sum(
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
   uint num_simds = (tgsize + simdgroup_size - 1) / simdgroup_size;
 
-  int flag = is_nonzero(input[tid]) ? 1 : 0;
+  int flag = is_nonzero(input[strided_offset(tid, sizes, strides, ndim)]) ? 1 : 0;
 
   // Inclusive prefix sum within SIMD group using shuffle
   int val = flag;
@@ -971,21 +990,34 @@ kernel void scatter_nonzero_indices(
     constant int64_t* sizes [[buffer(4)]],
     constant int* block_offsets [[buffer(5)]],
     constant int& max_entries [[buffer(6)]],
+    constant int64_t* strides [[buffer(7)]],
     uint tid [[thread_position_in_grid]],
     uint tgid [[threadgroup_position_in_grid]]) {
-  if (!is_nonzero(input[tid]))
+  // Decode logical flat index to per-dim indices (needed for both the
+  // physical read and writing the output coordinate array).
+  uint coords[16]; // max 16 dims enforced elsewhere
+  uint flat = tid;
+  for (int d = ndim - 1; d >= 0; d--) {
+    uint dim_size = static_cast<uint>(sizes[d]);
+    coords[d] = flat % dim_size;
+    flat /= dim_size;
+  }
+
+  // Compute physical offset using strides
+  uint phys = 0;
+  for (int d = 0; d < ndim; d++) {
+    phys += coords[d] * static_cast<uint>(strides[d]);
+  }
+
+  if (!is_nonzero(input[phys]))
     return;
 
   int pos = block_offsets[tgid] + prefix[tid];
   if (pos >= max_entries)
     return;
 
-  uint flat = tid;
-  for (int d = ndim - 1; d >= 0; d--) {
-    int64_t dim_size = sizes[d];
-    output[pos * ndim + d] =
-        static_cast<int64_t>(flat % static_cast<uint>(dim_size));
-    flat /= static_cast<uint>(dim_size);
+  for (int d = 0; d < ndim; d++) {
+    output[pos * ndim + d] = static_cast<int64_t>(coords[d]);
   }
 }
 
@@ -995,6 +1027,9 @@ kernel void scatter_nonzero_indices(
       const device DTYPE* input [[buffer(0)]],                               \
       device int* prefix [[buffer(1)]],                                      \
       device int* block_sums [[buffer(2)]],                                  \
+      constant int64_t* strides [[buffer(3)]],                               \
+      constant int64_t* sizes [[buffer(4)]],                                 \
+      constant int& ndim [[buffer(5)]],                                      \
       uint tid [[thread_position_in_grid]],                                  \
       uint lid [[thread_position_in_threadgroup]],                           \
       uint tgsize [[threads_per_threadgroup]],                               \
@@ -1011,6 +1046,7 @@ kernel void scatter_nonzero_indices(
       constant int64_t* sizes [[buffer(4)]],                                 \
       constant int* block_offsets [[buffer(5)]],                             \
       constant int& max_entries [[buffer(6)]],                               \
+      constant int64_t* strides [[buffer(7)]],                               \
       uint tid [[thread_position_in_grid]],                                  \
       uint tgid [[threadgroup_position_in_grid]])
 
