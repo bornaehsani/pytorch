@@ -200,12 +200,15 @@ static std::tuple<Tensor, Tensor> sdpa_vector_fast_mps(const Tensor& q_,
   uint q_batch_stride = q_.stride(0);
   uint q_head_stride = q_.stride(1);
   uint q_seq_stride = q_.stride(2);
+  uint q_elem_stride = q_.stride(3);
   uint k_batch_stride = k_.stride(0);
   uint k_head_stride = k_.stride(1);
   uint k_seq_stride = k_.stride(2);
+  uint k_elem_stride = k_.stride(3);
   uint v_batch_stride = v_.stride(0);
   uint v_head_stride = v_.stride(1);
   uint v_seq_stride = v_.stride(2);
+  uint v_elem_stride = v_.stride(3);
 
   auto out = at::empty({batchSize, num_head, qSize, headSize}, q_.options());
   auto attn = at::empty({batchSize, num_head, qSize, maxSeqLength}, q_.options());
@@ -231,6 +234,7 @@ static std::tuple<Tensor, Tensor> sdpa_vector_fast_mps(const Tensor& q_,
                   N,
                   std::array<uint32_t, 3>{q_head_stride, k_head_stride, v_head_stride},
                   std::array<uint32_t, 3>{q_seq_stride, k_seq_stride, v_seq_stride},
+                  std::array<uint32_t, 3>{q_elem_stride, k_elem_stride, v_elem_stride},
                   scale_factor);
 
       if (has_mask) {
@@ -238,10 +242,10 @@ static std::tuple<Tensor, Tensor> sdpa_vector_fast_mps(const Tensor& q_,
         uint kv_seq_stride = (nd >= 1 && mask_.value().size(nd - 1) > 1) ? mask_.value().stride(nd - 1) : 0;
         uint q_seq_stride = (nd >= 2 && mask_.value().size(nd - 2) > 1) ? mask_.value().stride(nd - 2) : 0;
         uint head_stride = (nd >= 3 && mask_.value().size(nd - 3) > 1) ? mask_.value().stride(nd - 3) : 0;
-        mtl_setArgs<9>(
+        mtl_setArgs<10>(
             computeEncoder, mask_.value(), std::array<uint32_t, 3>{kv_seq_stride, q_seq_stride, head_stride});
       }
-      mtl_setArgs<11>(
+      mtl_setArgs<12>(
           computeEncoder, has_mask, std::array<uint32_t, 4>{q_batch_stride, k_batch_stride, v_batch_stride, num_head});
       [computeEncoder dispatchThreadgroups:grid_dims threadsPerThreadgroup:group_dims];
     }
@@ -283,12 +287,15 @@ static std::tuple<Tensor, Tensor> sdpa_vector_2pass_mps(const Tensor& q_,
   uint q_batch_stride = q_.stride(0);
   uint q_head_stride = q_.stride(1);
   uint q_seq_stride = q_.stride(2);
+  uint q_elem_stride = q_.stride(3);
   uint k_batch_stride = k_.stride(0);
   uint k_head_stride = k_.stride(1);
   uint k_seq_stride = k_.stride(2);
+  uint k_elem_stride = k_.stride(3);
   uint v_batch_stride = v_.stride(0);
   uint v_head_stride = v_.stride(1);
   uint v_seq_stride = v_.stride(2);
+  uint v_elem_stride = v_.stride(3);
 
   auto out = at::empty({batchSize, num_heads, seq_len_q, headSize}, q_.options());
   auto intermediate = at::empty({batchSize, num_heads, seq_len_q, blocks, headSize}, q_.options());
@@ -327,6 +334,7 @@ static std::tuple<Tensor, Tensor> sdpa_vector_2pass_mps(const Tensor& q_,
                   N,
                   std::array<uint32_t, 3>{q_head_stride, k_head_stride, v_head_stride},
                   std::array<uint32_t, 3>{q_seq_stride, k_seq_stride, v_seq_stride},
+                  std::array<uint32_t, 3>{q_elem_stride, k_elem_stride, v_elem_stride},
                   scale_factor);
 
       if (has_mask) {
@@ -335,9 +343,9 @@ static std::tuple<Tensor, Tensor> sdpa_vector_2pass_mps(const Tensor& q_,
         uint kv_seq_stride = (nd >= 1 && mask.size(nd - 1) > 1) ? mask.stride(nd - 1) : 0;
         uint q_seq_stride = (nd >= 2 && mask.size(nd - 2) > 1) ? mask.stride(nd - 2) : 0;
         uint head_stride = (nd >= 3 && mask.size(nd - 3) > 1) ? mask.stride(nd - 3) : 0;
-        mtl_setArgs<11>(computeEncoder, mask, std::array<uint32_t, 3>{kv_seq_stride, q_seq_stride, head_stride});
+        mtl_setArgs<12>(computeEncoder, mask, std::array<uint32_t, 3>{kv_seq_stride, q_seq_stride, head_stride});
       }
-      mtl_setArgs<13>(
+      mtl_setArgs<14>(
           computeEncoder, has_mask, std::array<uint32_t, 4>{q_batch_stride, k_batch_stride, v_batch_stride, num_heads});
       [computeEncoder dispatchThreadgroups:grid_dims threadsPerThreadgroup:group_dims];
       // 2nd pass
@@ -465,10 +473,10 @@ struct PrefillAttnParamsHost {
   int gqa_factor;
   float scale;
   float softcapping;
-  int Q_strides[3];
-  int K_strides[3];
-  int V_strides[3];
-  int O_strides[3];
+  int Q_strides[4];
+  int K_strides[4];
+  int V_strides[4];
+  int O_strides[4];
 };
 
 struct PrefillAttnMaskParamsHost {
@@ -536,11 +544,6 @@ static std::tuple<Tensor, Tensor> sdpa_prefill_mps(const Tensor& q_,
 
   auto out = at::empty_like(q_);
 
-  // Strides for [B, H, L, D] layout. Last-dim stride must be 1.
-  TORCH_CHECK(q_.stride(-1) == 1, "sdpa prefill:query last-dim must be contiguous");
-  TORCH_CHECK(k_.stride(-1) == 1, "sdpa prefill:key last-dim must be contiguous");
-  TORCH_CHECK(v_.stride(-1) == 1, "sdpa prefill:value last-dim must be contiguous");
-
   PrefillAttnParamsHost params{};
   params.B = static_cast<int>(batchSize);
   params.H = static_cast<int>(num_heads);
@@ -553,15 +556,19 @@ static std::tuple<Tensor, Tensor> sdpa_prefill_mps(const Tensor& q_,
   params.Q_strides[0] = static_cast<int>(q_.stride(0));
   params.Q_strides[1] = static_cast<int>(q_.stride(1));
   params.Q_strides[2] = static_cast<int>(q_.stride(2));
+  params.Q_strides[3] = static_cast<int>(q_.stride(3));
   params.K_strides[0] = static_cast<int>(k_.stride(0));
   params.K_strides[1] = static_cast<int>(k_.stride(1));
   params.K_strides[2] = static_cast<int>(k_.stride(2));
+  params.K_strides[3] = static_cast<int>(k_.stride(3));
   params.V_strides[0] = static_cast<int>(v_.stride(0));
   params.V_strides[1] = static_cast<int>(v_.stride(1));
   params.V_strides[2] = static_cast<int>(v_.stride(2));
+  params.V_strides[3] = static_cast<int>(v_.stride(3));
   params.O_strides[0] = static_cast<int>(out.stride(0));
   params.O_strides[1] = static_cast<int>(out.stride(1));
   params.O_strides[2] = static_cast<int>(out.stride(2));
+  params.O_strides[3] = static_cast<int>(out.stride(3));
 
   const bool has_mask = mask_.has_value();
   std::optional<Tensor> mask_local;
@@ -753,24 +760,17 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
     return sdpa_general_mps(q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
   }
 
-  // Kernels load head-dim elements linearly, so stride(-1) == 1 is the only hard requirement
-  auto can_use_kernel_strides = [](const Tensor& t) -> bool { return t.stride(-1) == 1; };
-
-  Tensor q_contig = can_use_kernel_strides(q_) ? q_ : q_.contiguous();
-  Tensor k_contig = can_use_kernel_strides(k_) ? k_ : k_.contiguous();
-  Tensor v_contig = can_use_kernel_strides(v_) ? v_ : v_.contiguous();
-
   if (supports_prefill) {
-    return sdpa_prefill_mps(q_contig, k_contig, v_contig, mask_, is_causal, scale, query, unsqueezed);
+    return sdpa_prefill_mps(q_, k_, v_, mask_, is_causal, scale, query, unsqueezed);
   }
 
   // for short sequences, differentiate based on key sequence length
   if ((k_.size(2) >= 1024) || (k_.size(1) < q_.size(1) && k_.size(2) >= 4096)) {
     return sdpa_vector_2pass_mps(
-        q_contig, k_contig, v_contig, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
+        q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
   } else {
     return sdpa_vector_fast_mps(
-        q_contig, k_contig, v_contig, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
+        q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
   }
 }
 } // namespace native

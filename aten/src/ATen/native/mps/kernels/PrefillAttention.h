@@ -58,6 +58,7 @@ struct BlockLoaderT {
   PREFILL_CONST short vec_size = n_reads;
 
   const int src_ld;
+  const int src_elem_stride;
   const int tile_stride;
 
   const short thread_idx;
@@ -70,16 +71,18 @@ struct BlockLoaderT {
   METAL_FUNC BlockLoaderT(
       const device T* src_,
       const int src_ld_,
+      const int src_elem_stride_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]])
       : src_ld(src_ld_),
-        tile_stride(reduction_dim ? BCOLS : BROWS * src_ld),
+        src_elem_stride(src_elem_stride_),
+        tile_stride(reduction_dim ? BCOLS * src_elem_stride : BROWS * src_ld),
         thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(thread_idx / TCOLS),
         bj(vec_size * (thread_idx % TCOLS)),
         dst(dst_ + bi * kDstStrRow + bj * kDstStrCol),
-        src(src_ + bi * src_ld + bj) {}
+        src(src_ + bi * src_ld + bj * src_elem_stride) {}
 
   template <typename UnaryOp>
   METAL_FUNC void apply_inplace_op(thread const UnaryOp& op) const {
@@ -98,7 +101,7 @@ struct BlockLoaderT {
     for (short i = 0; i < BROWS; i += TROWS) {
       PREFILL_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
-        dst[i * kDstStrRow + j * kDstStrCol] = src[i * src_ld + j];
+        dst[i * kDstStrRow + j * kDstStrCol] = src[i * src_ld + j * src_elem_stride];
       }
     }
   }
@@ -128,7 +131,7 @@ struct BlockLoaderT {
       }
       PREFILL_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
-        tmp_val[j] = src[(tmp_idx[j] ? i * src_ld + j : 0)];
+        tmp_val[j] = src[(tmp_idx[j] ? i * src_ld + j * src_elem_stride : 0)];
       }
       PREFILL_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++) {
@@ -551,11 +554,11 @@ struct PrefillAttnParams {
   int gqa_factor; // num_q_heads / num_kv_heads
   float scale;
   float softcapping;
-  // Strides (B, H, L) - element stride in last dim is assumed to be 1.
-  int Q_strides[3];
-  int K_strides[3];
-  int V_strides[3];
-  int O_strides[3];
+  // Strides (B, H, L, D) - all four dimensions.
+  int Q_strides[4];
+  int K_strides[4];
+  int V_strides[4];
+  int O_strides[4];
 };
 
 struct PrefillAttnMaskParams {
@@ -645,10 +648,13 @@ prefill_attention(
   const int q_seq_stride = params->Q_strides[2];
   const int k_seq_stride = params->K_strides[2];
   const int v_seq_stride = params->V_strides[2];
+  const int q_elem_stride = params->Q_strides[3];
+  const int k_elem_stride = params->K_strides[3];
+  const int v_elem_stride = params->V_strides[3];
 
-  QBlockLoader loader_q(Q, q_seq_stride, Qs, simd_group_id, simd_lane_id);
-  KBlockLoader loader_k(K, k_seq_stride, Ks, simd_group_id, simd_lane_id);
-  VBlockLoader loader_v(V, v_seq_stride, Vs, simd_group_id, simd_lane_id);
+  QBlockLoader loader_q(Q, q_seq_stride, q_elem_stride, Qs, simd_group_id, simd_lane_id);
+  KBlockLoader loader_k(K, k_seq_stride, k_elem_stride, Ks, simd_group_id, simd_lane_id);
+  VBlockLoader loader_v(V, v_seq_stride, v_elem_stride, Vs, simd_group_id, simd_lane_id);
 
   // Apply softcapping by scaling the inputs before tanh.
   float adjusted_scale = params->scale;
@@ -949,16 +955,17 @@ prefill_attention(
   Otile.template row_bin_op<DivOp>(sum_score);
   threadgroup_barrier(mem_flags::mem_none);
 
-  device T* O_tile = O + (tm + sm) * params->O_strides[2] + sn;
+  const int o_elem_stride = params->O_strides[3];
+  device T* O_tile = O + (tm + sm) * params->O_strides[2] + sn * o_elem_stride;
 
   if (q_block_size < BQ) {
     if ((tm + sm) < q_block_size && sn < BD) {
       auto dst_tile_dims = short2(BD - sn, q_block_size - (tm + sm));
-      Otile.template store_safe<T, 1, 1>(
+      Otile.template store_safe<T, 1, o_elem_stride>(
           O_tile, params->O_strides[2], dst_tile_dims);
     }
   } else {
-    Otile.template store<T, 1, 1>(O_tile, params->O_strides[2]);
+    Otile.template store<T, 1, o_elem_stride>(O_tile, params->O_strides[2]);
   }
 }
 

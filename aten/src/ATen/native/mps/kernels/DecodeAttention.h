@@ -16,11 +16,12 @@ template <typename T, int D, int V = D, bool is_causal = false>
                             const constant uint& N [[buffer(5)]],
                             const constant uint3& qkv_head_strides [[buffer(6)]],
                             const constant uint3& qkv_seq_strides [[buffer(7)]],
-                            const constant float& scale [[buffer(8)]],
-                            const device bool* mask [[buffer(9)]],
-                            const constant uint3& mask_strides [[buffer(10)]],
-                            const constant bool& has_mask [[buffer(11)]],
-                            const constant uint4& qkv_batch_strides_heads [[buffer(12)]],
+                            const constant uint3& qkv_elem_strides [[buffer(8)]],
+                            const constant float& scale [[buffer(9)]],
+                            const device bool* mask [[buffer(10)]],
+                            const constant uint3& mask_strides [[buffer(11)]],
+                            const constant bool& has_mask [[buffer(12)]],
+                            const constant uint4& qkv_batch_strides_heads [[buffer(13)]],
                             uint3 tid [[threadgroup_position_in_grid]],
                             uint3 tpg [[threadgroups_per_grid]],
                             uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -31,12 +32,15 @@ template <typename T, int D, int V = D, bool is_causal = false>
   constexpr uint v_per_thread = V / BD;
   const uint q_head_stride = qkv_head_strides.x;
   const uint q_seq_stride = qkv_seq_strides.x;
+  const uint q_elem_stride = qkv_elem_strides.x;
   const uint q_batch_stride = qkv_batch_strides_heads.x;
   const uint k_head_stride = qkv_head_strides.y;
   const uint k_seq_stride = qkv_seq_strides.y;
+  const uint k_elem_stride = qkv_elem_strides.y;
   const uint k_batch_stride = qkv_batch_strides_heads.y;
   const uint v_head_stride = qkv_head_strides.z;
   const uint v_seq_stride = qkv_seq_strides.z;
+  const uint v_elem_stride = qkv_elem_strides.z;
   const uint v_batch_stride = qkv_batch_strides_heads.z;
   const uint num_heads = qkv_batch_strides_heads.w;
   const uint mask_kv_seq_stride = mask_strides.x;
@@ -64,19 +68,19 @@ template <typename T, int D, int V = D, bool is_causal = false>
   const int group_offset = bh_idx * Q + q_seq_idx;
   const int o_offset = group_offset;
   queries +=
-      batch_idx * q_batch_stride + head_idx * q_head_stride + q_seq_idx * q_seq_stride + simd_lid * qk_per_thread;
-  keys += batch_idx * k_batch_stride + kv_head_idx * k_head_stride + simd_gid * k_seq_stride + simd_lid * qk_per_thread;
+      batch_idx * q_batch_stride + head_idx * q_head_stride + q_seq_idx * q_seq_stride;
+  keys += batch_idx * k_batch_stride + kv_head_idx * k_head_stride + simd_gid * k_seq_stride;
   values +=
-      batch_idx * v_batch_stride + kv_head_idx * v_head_stride + simd_gid * v_seq_stride + simd_lid * v_per_thread;
+      batch_idx * v_batch_stride + kv_head_idx * v_head_stride + simd_gid * v_seq_stride;
   if (has_mask) {
     mask += bh_idx * mask_head_stride + simd_gid * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
 
-  out += o_offset * V + simd_gid * v_per_thread;
+  out += o_offset * V;
 
   // Read the query and 0 the output accumulator
   for (uint i = 0; i < qk_per_thread; i++) {
-    q[i] = scale * static_cast<U>(queries[i]);
+    q[i] = scale * static_cast<U>(queries[(simd_lid * qk_per_thread + i) * q_elem_stride]);
   }
   for (uint i = 0; i < v_per_thread; i++) {
     o[i] = 0;
@@ -96,7 +100,7 @@ template <typename T, int D, int V = D, bool is_causal = false>
     if (use_key) {
       // Read the key
       for (uint j = 0; j < qk_per_thread; j++) {
-        k[j] = static_cast<U>(keys[j]);
+        k[j] = static_cast<U>(keys[(simd_lid * qk_per_thread + j) * k_elem_stride]);
       }
 
       // Compute the i-th score
@@ -116,7 +120,7 @@ template <typename T, int D, int V = D, bool is_causal = false>
 
       // Update the output accumulator
       for (uint j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * static_cast<U>(values[j]);
+        o[j] = o[j] * factor + exp_score * static_cast<U>(values[(simd_lid * v_per_thread + j) * v_elem_stride]);
       }
     }
 
@@ -153,7 +157,7 @@ template <typename T, int D, int V = D, bool is_causal = false>
   // And write the output
   if (simd_lid == 0) {
     for (uint i = 0; i < v_per_thread; i++) {
-      out[i] = static_cast<T>(o[i]);
+      out[(simd_gid * v_per_thread + i)] = static_cast<T>(o[i]);
     }
   }
 }
@@ -169,11 +173,12 @@ template <typename T, int D, int V = D, bool is_causal = false>
                                     const constant uint& N [[buffer(7)]],
                                     const constant uint3& qkv_head_strides [[buffer(8)]],
                                     const constant uint3& qkv_seq_strides [[buffer(9)]],
-                                    const constant float& scale [[buffer(10)]],
-                                    const device bool* mask [[buffer(11)]],
-                                    const constant uint3& mask_strides [[buffer(12)]],
-                                    const constant bool& has_mask [[buffer(13)]],
-                                    const constant uint4& qkv_batch_strides_heads [[buffer(14)]],
+                                    const constant uint3& qkv_elem_strides [[buffer(10)]],
+                                    const constant float& scale [[buffer(11)]],
+                                    const device bool* mask [[buffer(12)]],
+                                    const constant uint3& mask_strides [[buffer(13)]],
+                                    const constant bool& has_mask [[buffer(14)]],
+                                    const constant uint4& qkv_batch_strides_heads [[buffer(15)]],
                                     uint3 tid [[threadgroup_position_in_grid]],
                                     uint3 tpg [[threadgroups_per_grid]],
                                     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -184,12 +189,15 @@ template <typename T, int D, int V = D, bool is_causal = false>
   constexpr int v_per_thread = V / BD;
   const int q_head_stride = qkv_head_strides.x;
   const int q_seq_stride = qkv_seq_strides.x;
+  const int q_elem_stride = qkv_elem_strides.x;
   const int q_batch_stride = qkv_batch_strides_heads.x;
   const int k_head_stride = qkv_head_strides.y;
   const int k_seq_stride = qkv_seq_strides.y;
+  const int k_elem_stride = qkv_elem_strides.y;
   const int k_batch_stride = qkv_batch_strides_heads.y;
   const int v_head_stride = qkv_head_strides.z;
   const int v_seq_stride = qkv_seq_strides.z;
+  const int v_elem_stride = qkv_elem_strides.z;
   const int v_batch_stride = qkv_batch_strides_heads.z;
   const int num_heads = qkv_batch_strides_heads.w;
   const int mask_kv_seq_stride = mask_strides.x;
@@ -218,11 +226,9 @@ template <typename T, int D, int V = D, bool is_causal = false>
   const int kv_head_idx = head_idx / gqa_factor;
 
   queries +=
-      batch_idx * q_batch_stride + head_idx * q_head_stride + q_seq_idx * q_seq_stride + simd_lid * qk_per_thread;
-  keys += batch_idx * k_batch_stride + kv_head_idx * k_head_stride + (block_idx * BN + simd_gid) * k_seq_stride +
-      simd_lid * qk_per_thread;
-  values += batch_idx * v_batch_stride + kv_head_idx * v_head_stride + (block_idx * BN + simd_gid) * v_seq_stride +
-      simd_lid * v_per_thread;
+      batch_idx * q_batch_stride + head_idx * q_head_stride + q_seq_idx * q_seq_stride;
+  keys += batch_idx * k_batch_stride + kv_head_idx * k_head_stride + (block_idx * BN + simd_gid) * k_seq_stride;
+  values += batch_idx * v_batch_stride + kv_head_idx * v_head_stride + (block_idx * BN + simd_gid) * v_seq_stride;
   out += o_offset * blocks * V + block_idx * V + simd_lid * v_per_thread;
   if (has_mask) {
     mask +=
@@ -233,7 +239,7 @@ template <typename T, int D, int V = D, bool is_causal = false>
 
   // Read the query and 0 the output accumulator
   for (uint i = 0; i < qk_per_thread; i++) {
-    q[i] = scale * static_cast<U>(queries[i]);
+    q[i] = scale * static_cast<U>(queries[(simd_lid * qk_per_thread + i) * q_elem_stride]);
   }
   for (uint i = 0; i < v_per_thread; i++) {
     o[i] = 0;
@@ -253,7 +259,7 @@ template <typename T, int D, int V = D, bool is_causal = false>
     if (use_key) {
       // Read the key
       for (uint j = 0; j < qk_per_thread; j++) {
-        k[j] = static_cast<U>(keys[j]);
+        k[j] = static_cast<U>(keys[(simd_lid * qk_per_thread + j) * k_elem_stride]);
       }
 
       // Compute the i-th score
@@ -273,7 +279,7 @@ template <typename T, int D, int V = D, bool is_causal = false>
 
       // Update the output accumulator
       for (uint j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * static_cast<U>(values[j]);
+        o[j] = o[j] * factor + exp_score * static_cast<U>(values[(simd_lid * v_per_thread + j) * v_elem_stride]);
       }
     }
 
@@ -387,11 +393,12 @@ template <typename T, int D>
                                                 const constant uint& N [[buffer(5)]],                         \
                                                 const constant uint3& qkv_head_strides [[buffer(6)]],         \
                                                 const constant uint3& qkv_seq_strides [[buffer(7)]],          \
-                                                const constant float& scale [[buffer(8)]],                    \
-                                                const device bool* mask [[buffer(9)]],                        \
-                                                const constant uint3& mask_strides [[buffer(10)]],            \
-                                                const constant bool& has_mask [[buffer(11)]],                 \
-                                                const constant uint4& qkv_batch_strides_heads [[buffer(12)]], \
+                                                const constant uint3& qkv_elem_strides [[buffer(8)]],         \
+                                                const constant float& scale [[buffer(9)]],                    \
+                                                const device bool* mask [[buffer(10)]],                       \
+                                                const constant uint3& mask_strides [[buffer(11)]],            \
+                                                const constant bool& has_mask [[buffer(12)]],                 \
+                                                const constant uint4& qkv_batch_strides_heads [[buffer(13)]], \
                                                 uint3 tid [[threadgroup_position_in_grid]],                   \
                                                 uint3 tpg [[threadgroups_per_grid]],                          \
                                                 uint simd_gid [[simdgroup_index_in_threadgroup]],             \
@@ -413,11 +420,12 @@ template <typename T, int D>
                                                         const constant uint& N [[buffer(7)]],                         \
                                                         const constant uint3& qkv_head_strides [[buffer(8)]],         \
                                                         const constant uint3& qkv_seq_strides [[buffer(9)]],          \
-                                                        const constant float& scale [[buffer(10)]],                   \
-                                                        const device bool* mask [[buffer(11)]],                       \
-                                                        const constant uint3& mask_strides [[buffer(12)]],            \
-                                                        const constant bool& has_mask [[buffer(13)]],                 \
-                                                        const constant uint4& qkv_batch_strides_heads [[buffer(14)]], \
+                                                        const constant uint3& qkv_elem_strides [[buffer(10)]],        \
+                                                        const constant float& scale [[buffer(11)]],                   \
+                                                        const device bool* mask [[buffer(12)]],                       \
+                                                        const constant uint3& mask_strides [[buffer(13)]],            \
+                                                        const constant bool& has_mask [[buffer(14)]],                 \
+                                                        const constant uint4& qkv_batch_strides_heads [[buffer(15)]], \
                                                         uint3 tid [[threadgroup_position_in_grid]],                   \
                                                         uint3 tpg [[threadgroups_per_grid]],                          \
                                                         uint simd_gid [[simdgroup_index_in_threadgroup]],             \
