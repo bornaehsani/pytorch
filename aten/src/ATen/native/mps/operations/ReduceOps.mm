@@ -834,7 +834,8 @@ static void argmax_argmin_out_mps(const Tensor& input_t,
       newCachedGraph->outputTensor_ = outputClampedTensor;
     });
 
-    auto inputPlaceholder = Placeholder(cachedGraph->inputTensor_, input_t, apparent_in_shape);
+    const Tensor input_contig = input_t.contiguous();
+    auto inputPlaceholder = Placeholder(cachedGraph->inputTensor_, input_contig, apparent_in_shape);
     auto outputPlaceholder = Placeholder(cachedGraph->outputTensor_, output_t, apparent_out_shape);
 
     auto feeds = dictionaryFromPlaceholders(inputPlaceholder);
